@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import re
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
@@ -10,6 +11,8 @@ import pickle
 from langchain_community.vectorstores import Chroma
 from langchain_community.vectorstores import FAISS
 from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
 
 # 1. Загрузка данных
 train_data = pd.read_csv('./data/train_data.csv')
@@ -43,14 +46,29 @@ text_splitter = RecursiveCharacterTextSplitter(
     length_function=count_tokens,  # Функция подсчёта длины
 )
 
-# Разбиваем текст для каждой строки
-chunks_list = []
-for text in train_data['cleaned_text']:
-    chunks = text_splitter.split_text(text)
-    chunks_list.append(chunks)
+if os.path.exists("chunks_cache.pkl"):
+    print("Загружаем сохранённые чанки...")
+    with open("chunks_cache.pkl", "rb") as f:
+        cached_chunks = pickle.load(f)
+    # проверяем, что файл действительно содержит колонки id и chunks
+    if isinstance(cached_chunks, pd.DataFrame):
+        train_data = train_data.merge(cached_chunks, on='id', how='left')
+    else:
+        print("⚠️ Файл chunks_cache.pkl не в формате DataFrame, пересоздаём чанки...")
+        cached_chunks = None
+else:
+    print("Файл с чанками не найден — создаём заново...")
+    chunks_list = []
+    for text in train_data['cleaned_text']:
+        chunks = text_splitter.split_text(text)
+        chunks_list.append(chunks)
+    # Добавляем разбитые тексты обратно в DataFrame
+    train_data['chunks'] = chunks_list
+    # Кеш чанков
+    with open("chunks_cache.pkl", "wb") as f:
+        pickle.dump(train_data[['id', 'chunks']], f)
 
-# Добавляем разбитые тексты обратно в DataFrame
-train_data['chunks'] = chunks_list
+
 
 # 4. Подготовка документов
 documents = []
@@ -180,71 +198,119 @@ if not texts or not embeddings_array:
     print("Ошибка: после фильтрации не осталось валидных данных.")
     exit(1)
 
+doc_db = {}
+for i, doc in enumerate(documents):
+    doc_db[doc.metadata["id"]] = {
+        "document": doc,
+        "embedding": np.array(embeddings_array[i])  # numpy
+    }
 
-# Путь к сохранённому индексу FAISS
-FAISS_INDEX_PATH = "./faiss_index"
+with open("doc_db.pkl", "wb") as f:
+    pickle.dump(doc_db, f)
 
-# Проверка: существует ли сохранённый индекс?
-if os.path.exists(FAISS_INDEX_PATH):
-    # Загружаем существующий индекс
-    vectorstore = FAISS.load_local(
-        FAISS_INDEX_PATH,
-        embeddings=None  # если эмбеддинги уже в индексе
-    )
-    print("Загружено существующее FAISS-хранилище.")
-else:
-    # Создаём новое хранилище ТОЛЬКО если есть документы для добавления
-    if documents:  # если список документов не пуст
-        vectorstore = FAISS.from_embeddings(
-                                            texts=texts,
-                                            embeddings=embeddings_array,
-                                            embedding=None
-                                            )
-        print("Создано новое FAISS-хранилище с документами.")
-    else:
-        # Если документов нет — создаём "пустышку" через обходной путь
-        # (FAISS требует хотя бы 1 вектор для инициализации)
-        dummy_embedding = [0.0] * 1536  # фиктивный эмбеддинг
-        dummy_doc = Document(page_content="", metadata={"id": "dummy"})
-        vectorstore = FAISS.from_embeddings(
-                                            texts=texts,
-                                            embeddings=embeddings_array,
-                                            embedding=None
-                                            )
-        # Удаляем фиктивный документ сразу после создания
-        vectorstore.delete(ids=["dummy"])
-        print("Создано пустое FAISS-хранилище (через обходной путь).")
+"""
+pp = pprint.PrettyPrinter(indent=2)
 
-# Удаляем старые версии документов с теми же ID
-doc_ids = [doc.metadata["id"] for doc in documents]
-existing_docs = vectorstore.get(ids=doc_ids)
+pp.pprint(doc_db)
+print(f"Всего документов в doc_db: {len(doc_db)}")
+# Проверяем, все ли эмбеддинги одинаковой длины
+emb_lengths = [len(data["embedding"]) for data in doc_db.values()]
+print(f"Длина эмбеддингов: {set(emb_lengths)} (должно быть {emb_lengths[0]})")
+# Список всех ID
+print(f"Список ID: {list(doc_db.keys())}")
+"""
+"""
+for doc_id, data in doc_db.items():
+    print(f"ID: {doc_id}")
+    print(f"  Metadata: {data['document'].metadata}")
+    print(f"  Content length: {len(data['document'].page_content)} символов")
+    print(f"  Embedding shape: {data['embedding'].shape}")
+    print("-! * 50")
+"""
 
-existing_ids = []
-if "documents" in existing_docs and existing_docs["documents"]:
-    existing_ids = [doc.metadata["id"] for doc in existing_docs["documents"]]
-    if existing_ids:
-        vectorstore.delete(ids=existing_ids)
-        print(f"Удалено {len(existing_ids)} документов с повторяющимися ID.")
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
 
-else:
-    print("Нет существующих документов для удаления.")
+# === 1. Загрузка базы документов (из предыдущего этапа) ===
+with open("doc_db.pkl", "rb") as f:
+    doc_db = pickle.load(f)
 
-# Добавляем новые документы с эмбеддингами
-print(f"Добавляем {len(documents)} новых документов...")
-vectorstore.add_embeddings(
-    embeddings=embeddings_array,  # список списков чисел (без numpy!)
-    documents=documents            # список Document
+print(f"✅ Загружено документов: {len(doc_db)}")
+
+# ================== 2. Вопрос пользователя СЮДА ПИСАТЬ ВОПРОС ===================
+user_question = "Куда обращаться, если заемные деньги ушли мошенникам?"
+
+# === 3. Генерация эмбеддинга для вопроса ===
+emb_client = OpenAI(
+    base_url="https://ai-for-finance-hack.up.railway.app/",
+    api_key="sk-k4GzLvBEsBYNbtVPpDaEMg"
 )
 
-# Дополнительная проверка: нет ли уже документов с такими ID?
-# (FAISS не гарантирует уникальность ID, поэтому проверяем вручную)
-existing_after = vectorstore.get(ids=doc_ids)
-if existing_after and existing_after["documents"]:
-    print("Предупреждение: документы с такими ID уже присутствуют в хранилище.")
-else:
-    print("Все документы успешно добавлены.")
+print("📊 Генерация эмбеддинга вопроса через модель для эмбендингов...")
+question_emb = emb_client.embeddings.create(
+    model="text-embedding-3-small",
+    input=user_question
+).data[0].embedding
 
-# Сохраняем обновлённое хранилище на диск
-print("Сохраняем FAISS-хранилище на диск...")
-vectorstore.save_local(FAISS_INDEX_PATH)
-print("Готово! FAISS-хранилище обновлено и сохранено.")
+# === 4. Поиск ближайших документов ===
+# Косинусное сходство
+def cosine_similarity(a, b):
+    a = np.array(a)
+    b = np.array(b)
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+# Считаем схожесть между вопросом и каждым документом
+similarities = []
+for doc_id, doc_data in doc_db.items():
+    sim = cosine_similarity(question_emb, doc_data["embedding"])
+    similarities.append((doc_id, sim))
+
+# Сортируем документы по схожести и выбираем топ-5
+top_docs = sorted(similarities, key=lambda x: x[1], reverse=True)[:5]
+
+# === 5. Формируем контекст из ближайших документов ===
+context_parts = []
+for doc_id, sim in top_docs:
+    doc = doc_db[doc_id]["document"]
+    meta = doc.metadata
+    block = (
+        f"Текст: {doc.page_content}\n"
+        f"Аннотация: {meta.get('annotation', '')}\n"
+        f"Теги: {meta.get('tags', '')}"
+    )
+    context_parts.append(block)
+
+context = "\n\n".join(context_parts)
+
+
+# ====================== 6. Формируем промпт. СЮДА ВСТАВЛЯТЬ ПРОМТ ===========================
+system_prompt = (
+    "Ты финансовый ассистент. Отвечай чётко, по-русски, используя только факты из контекста. Не используй Markdown или выделения. Читай весь контект и дай единый полный ответ по присланным данным. Если в контексте нет данных для какого-либо вопроса — напиши об этом прямо, без выдумок. Но дай все равно обобщенный ответ. Не используй Markdown, звёздочки, эмодзи или форматирование. Ответ должен быть текстом, структурированным по пунктам."
+)
+user_prompt = f"Контекст:\n{context}\n\nВопрос:\n{user_question}\n\nОтвет:" # сюда автоматически подтягивается контект и вопрос 
+
+
+# === 7. Отправляем запрос к LLM (через langchain-openai) ===
+llm = ChatOpenAI(
+    api_key="sk-BuwLErZ4eL4yTAjfQxLaIA",  # ключ для LLM
+    base_url="https://ai-for-finance-hack.up.railway.app/",
+    model="openrouter/mistralai/mistral-small-3.2-24b-instruct",
+    temperature=0.2,
+    max_tokens=500
+)
+# === 7.1. Печатаем полный текст, который отправляем в модель ===
+print("\n================= 📤 ПОЛНЫЙ ПРОМПТ, ОТПРАВЛЯЕМЫЙ В LLM =================")
+print(f"\n[System message]\n{system_prompt}\n")
+print(f"[User message]\n{user_prompt}\n")
+print("=====================================================================\n")
+
+print("🤖 Отправка запроса к модели...")
+messages = [
+    SystemMessage(content=system_prompt),
+    HumanMessage(content=user_prompt)
+]
+
+response = llm.invoke(messages)
+
+# === 8. Выводим ответ ===
+print("\n💬 Ответ модели:")
+print(response.content)
