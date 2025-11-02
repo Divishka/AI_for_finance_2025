@@ -237,59 +237,24 @@ with open("doc_db.pkl", "rb") as f:
 print(f"✅ Загружено документов: {len(doc_db)}")
 
 # ================== 2. Вопрос пользователя СЮДА ПИСАТЬ ВОПРОС ===================
-user_question = "Куда обращаться, если заемные деньги ушли мошенникам?"
-
-# === 3. Генерация эмбеддинга для вопроса ===
-emb_client = OpenAI(
-    base_url="https://ai-for-finance-hack.up.railway.app/",
-    api_key="sk-k4GzLvBEsBYNbtVPpDaEMg"
+questions_df = pd.read_csv(
+    './data/questions.csv',
+    sep=None,  # автоопределение разделителя
+    engine='python'  # требуется для auto-sep
+)
+print(f"📥 Загружено {len(questions_df)} вопросов из questions.csv")
+# Полная очистка всех скрытых символов в названиях столбцов
+questions_df.columns = (
+    questions_df.columns
+    .str.replace(r'[^\w\s]', '', regex=True)  # убираем невидимые и спецсимволы
+    .str.strip()  # убираем пробелы по краям
 )
 
-print("📊 Генерация эмбеддинга вопроса через модель для эмбендингов...")
-question_emb = emb_client.embeddings.create(
-    model="text-embedding-3-small",
-    input=user_question
-).data[0].embedding
-
-# === 4. Поиск ближайших документов ===
-# Косинусное сходство
-def cosine_similarity(a, b):
-    a = np.array(a)
-    b = np.array(b)
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-# Считаем схожесть между вопросом и каждым документом
-similarities = []
-for doc_id, doc_data in doc_db.items():
-    sim = cosine_similarity(question_emb, doc_data["embedding"])
-    similarities.append((doc_id, sim))
-
-# Сортируем документы по схожести и выбираем топ-5
-top_docs = sorted(similarities, key=lambda x: x[1], reverse=True)[:5]
-
-# === 5. Формируем контекст из ближайших документов ===
-context_parts = []
-for doc_id, sim in top_docs:
-    doc = doc_db[doc_id]["document"]
-    meta = doc.metadata
-    block = (
-        f"Текст: {doc.page_content}\n"
-        f"Аннотация: {meta.get('annotation', '')}\n"
-        f"Теги: {meta.get('tags', '')}"
-    )
-    context_parts.append(block)
-
-context = "\n\n".join(context_parts)
+# Проверяем, какие колонки реально есть:
+print("📋 Найденные колонки:", list(questions_df.columns))
 
 
-# ====================== 6. Формируем промпт. СЮДА ВСТАВЛЯТЬ ПРОМТ ===========================
-system_prompt = (
-    "Ты финансовый ассистент. Отвечай чётко, по-русски, используя только факты из контекста. Не используй Markdown или выделения. Читай весь контект и дай единый полный ответ по присланным данным. Если в контексте нет данных для какого-либо вопроса — напиши об этом прямо, без выдумок. Но дай все равно обобщенный ответ. Не используй Markdown, звёздочки, эмодзи или форматирование. Ответ должен быть текстом, структурированным по пунктам."
-)
-user_prompt = f"Контекст:\n{context}\n\nВопрос:\n{user_question}\n\nОтвет:" # сюда автоматически подтягивается контект и вопрос 
-
-
-# === 7. Отправляем запрос к LLM (через langchain-openai) ===
+# === 3. Настройка OpenAI-клиентов ===
 llm = ChatOpenAI(
     api_key="sk-BuwLErZ4eL4yTAjfQxLaIA",  # ключ для LLM
     base_url="https://ai-for-finance-hack.up.railway.app/",
@@ -297,20 +262,89 @@ llm = ChatOpenAI(
     temperature=0.2,
     max_tokens=500
 )
-# === 7.1. Печатаем полный текст, который отправляем в модель ===
-print("\n================= 📤 ПОЛНЫЙ ПРОМПТ, ОТПРАВЛЯЕМЫЙ В LLM =================")
-print(f"\n[System message]\n{system_prompt}\n")
-print(f"[User message]\n{user_prompt}\n")
-print("=====================================================================\n")
+emb_client = OpenAI(
+    base_url="https://ai-for-finance-hack.up.railway.app/",
+    api_key="sk-k4GzLvBEsBYNbtVPpDaEMg"
+)
 
-print("🤖 Отправка запроса к модели...")
-messages = [
-    SystemMessage(content=system_prompt),
-    HumanMessage(content=user_prompt)
-]
+# === 4. Результаты будем сохранять сюда ===
+results = []
 
-response = llm.invoke(messages)
+# === 5. Проходим по всем вопросам ===
+for idx, row in questions_df.iterrows():
+    question_id = row['ID вопроса']
+    user_question = row['Вопрос']
+    print(f"\n===============================")
+    print(f"🧩 Вопрос {question_id}: {user_question}")
 
-# === 8. Выводим ответ ===
-print("\n💬 Ответ модели:")
-print(response.content)
+  # === 5.1 Генерация эмбеддинга вопроса ===
+    try:
+        question_emb = emb_client.embeddings.create(
+            model="text-embedding-3-small",
+            input=user_question
+        ).data[0].embedding
+    except Exception as e:
+        print(f"⚠️ Ошибка при генерации эмбеддинга: {e}")
+        results.append([question_id, user_question, "", f"Ошибка: {e}"])
+        continue
+
+
+    # === 4. Поиск ближайших документов ===
+    # Косинусное сходство
+    def cosine_similarity(a, b):
+        a = np.array(a)
+        b = np.array(b)
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+    # Считаем схожесть между вопросом и каждым документом
+    similarities = []
+    for doc_id, doc_data in doc_db.items():
+        sim = cosine_similarity(question_emb, doc_data["embedding"])
+        similarities.append((doc_id, sim))
+
+    # Сортируем документы по схожести и выбираем топ-5
+    top_docs = sorted(similarities, key=lambda x: x[1], reverse=True)[:5]
+
+    # === 5. Формируем контекст из ближайших документов ===
+    context_parts = []
+    for doc_id, sim in top_docs:
+        doc = doc_db[doc_id]["document"]
+        meta = doc.metadata
+        block = (
+            f"Текст: {doc.page_content}\n"
+            f"Аннотация: {meta.get('annotation', '')}\n"
+            f"Теги: {meta.get('tags', '')}"
+        )
+        context_parts.append(block)
+
+    context = "\n\n".join(context_parts)
+
+
+    # ====================== 6. Формируем промпт. СЮДА ВСТАВЛЯТЬ ПРОМТ ===========================
+    system_prompt = (
+        "Ты финансовый ассистент. Отвечай чётко, по-русски, используя только факты из контекста. Не используй Markdown или выделения. Читай весь контект и дай единый полный ответ по присланным данным. Если в контексте нет данных для какого-либо вопроса — напиши об этом прямо, без выдумок. Но дай все равно обобщенный ответ. Не используй Markdown, звёздочки, эмодзи или форматирование. Ответ должен быть текстом, структурированным по пунктам."
+    )
+    user_prompt = f"Контекст:\n{context}\n\nВопрос:\n{user_question}\n\nОтвет:" # сюда автоматически подтягивается контект и вопрос 
+
+    # === 7. Отправляем запрос к LLM  ===
+    print("\n🤖 Отправка запроса к модели...")
+    try:
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ]
+        response = llm.invoke(messages)
+        answer_text = response.content.strip()
+    except Exception as e:
+        print(f"⚠️ Ошибка при получении ответа от модели: {e}")
+        answer_text = f"Ошибка при обработке: {e}"
+
+    # === 5.6 Сохраняем результат ===
+    results.append([question_id, user_question, context, answer_text])
+
+    print(f"✅ Ответ получен для вопроса {question_id}")
+
+# === 6. Сохраняем всё в CSV ===
+output_df = pd.DataFrame(results, columns=["ID вопроса", "Вопрос", "Контекст", "Ответ модели"])
+output_df.to_csv("./data/answers.csv", index=False, encoding="utf-8-sig")
+print("\n💾 Все ответы сохранены в ./data/answers.csv")
