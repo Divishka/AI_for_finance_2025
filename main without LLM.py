@@ -18,6 +18,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 train_data = pd.read_csv('./data/train_data.csv')
 
 # 2. Очистка текста от лишних символов
+train_data['text'] = train_data['text'].astype(str).str[:-8]
 def clean_text(text):
     # Удаляем символы Markdown (#, ** и др.) и прочие нетекстовые элементы
     text = re.sub(r'[#*]+', '', text)  # Удаляем # и *
