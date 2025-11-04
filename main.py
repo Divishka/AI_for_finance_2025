@@ -1,19 +1,24 @@
 import pandas as pd
+import numpy as np
 import re
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from transformers import AutoTokenizer, AutoModel
-import torch
 import os
-
-
+from openai import OpenAI, APIConnectionError, RateLimitError
+import pickle
+from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import FAISS
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
 
 # 1. Загрузка данных
 train_data = pd.read_csv('./data/train_data.csv')
 
 # 2. Очистка текста от лишних символов
+#train_data['text'] = train_data['text'].astype(str).str[:-8]
 def clean_text(text):
     # Удаляем символы Markdown (#, ** и др.) и прочие нетекстовые элементы
     text = re.sub(r'[#*]+', '', text)  # Удаляем # и *
@@ -24,24 +29,16 @@ def clean_text(text):
 
 # Применяем очистку к столбцу 'text'
 train_data['cleaned_text'] = train_data['text'].apply(clean_text)
-"""
-# 3. Подготовка токенизатора для подсчёта токенов
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")  # Можно заменить на другую модель
-"""
+
 # 2. Токенизатор и разбивка на чанки
 try:
     tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-    model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
 except Exception as e:
     print(f"Ошибка загрузки модели: {e}")
     exit(1)
-
-print("Модель загружена:", model is not None)
-print("Токенизатор загружен:", tokenizer is not None)
-
 # Функция для подсчёта токенов
 def count_tokens(text):
-    return len(tokenizer.encode(text))
+    return len(tokenizer(text, truncation=False, padding=False)['input_ids'])
 
 # 4. Разбивка текста на эмбеддинги (чанки)
 text_splitter = RecursiveCharacterTextSplitter(
@@ -50,146 +47,304 @@ text_splitter = RecursiveCharacterTextSplitter(
     length_function=count_tokens,  # Функция подсчёта длины
 )
 
-# Разбиваем текст для каждой строки
-chunks_list = []
-for text in train_data['cleaned_text']:
-    chunks = text_splitter.split_text(text)
-    chunks_list.append(chunks)
+if os.path.exists("chunks_cache.pkl"):
+    print("Загружаем сохранённые чанки...")
+    with open("chunks_cache.pkl", "rb") as f:
+        cached_chunks = pickle.load(f)
+    # проверяем, что файл действительно содержит колонки id и chunks
+    if isinstance(cached_chunks, pd.DataFrame):
+        train_data = train_data.merge(cached_chunks, on='id', how='left')
+    else:
+        print("⚠️ Файл chunks_cache.pkl не в формате DataFrame, пересоздаём чанки...")
+        cached_chunks = None
+else:
+    print("Файл с чанками не найден — создаём заново...")
+    chunks_list = []
+    for text in train_data['cleaned_text']:
+        chunks = text_splitter.split_text(text)
+        chunks_list.append(chunks)
+    # Добавляем разбитые тексты обратно в DataFrame
+    train_data['chunks'] = chunks_list
+    # Кеш чанков
+    with open("chunks_cache.pkl", "wb") as f:
+        pickle.dump(train_data[['id', 'chunks']], f)
 
-# Добавляем разбитые тексты обратно в DataFrame
-train_data['chunks'] = chunks_list
 
-"""
-# 5. Сохраняем отредактированный DataFrame в новый CSV-файл
-output_file_path = './data/train_data_with_chunks.csv'  # Путь к новому файлу
-train_data.to_csv(output_file_path, index=False)
 
-print(f"Отредактированные данные сохранены в файл: {output_file_path}")
-
-# Пример вывода первых 5 строк с разбитыми текстами
-print(train_data[['id', 'chunks']].head())
-
-# Вывод полных чанков для первых 10 статей
-print("\n" + "="*80)
-print("ПОЛНЫЕ ЧАНКИ ДЛЯ ПЕРВЫХ 10 СТАТЕЙ")
-print("="*80)
-
-for idx, row in train_data.head(3).iterrows():
-    print(f"\nID: {row['id']}")
-    print(f"Количество чанков: {len(row['chunks'])}")
-    print("-"*50)
-    
-    for i, chunk in enumerate(row['chunks'], 1):
-        print(f"  Чанк {i} (длина: {count_tokens(chunk)} токенов):")
-        print(f"    {chunk[:500]}...")  # Первые 500 символов + многоточие
-        print()  # Пустая строка между чанками
-    
-    print("-"*50)
-"""
-
-# 4. Подготовка документов для LangChain
+# 4. Подготовка документов
 documents = []
 for _, row in train_data.iterrows():
     for chunk in row['chunks']:
+        metadata={"id": row['id'], 
+                      "source": "train_data", 
+                      "tags": row.get('tags', []), 
+                      "annotation": row.get('annotation', "")}
         doc = Document(
-            page_content=chunk,
-            metadata={"id": row['id'], "source": "train_data"}
-        )
+            page_content=chunk, 
+            metadata=metadata
+            )
         documents.append(doc)
 
-# 2. Формируем список текстов для эмбеддинга
+# 6. Формирование текстов для эмбеддинга
 texts = [doc.page_content for doc in documents]
-# 3. Проверяем данные
-print(f"Длина texts: {len(texts)}")
-if texts:
-    print(f"Первый текст (первые 200 символов): {texts[0][:200]}...")
-else:
-    print("Список texts пуст!")
+MAX_TEXTS = 10000
+texts = texts[:MAX_TEXTS]
+print(f"Обрабатываем {len(texts)} текстов (лимит: {MAX_TEXTS})")
 
-def get_embeddings_batch(texts, model, tokenizer, batch_size=32):
-    """
-    Генерирует эмбеддинги для текстов пакетно, чтобы не перегружать память
-    """
+if not texts:
+    print("Список texts пуст. Завершаем работу.")
+    exit()
+
+# 7. Функция для генерации эмбеддингов
+client = OpenAI(
+    base_url="https://ai-for-finance-hack.up.railway.app/",
+    api_key="sk-k4GzLvBEsBYNbtVPpDaEMg"
+)
+
+def get_openai_embeddings(texts, model="text-embedding-3-small"):
+    """Генерирует эмбеддинги через OpenAI API"""
     embeddings = []
-    total_batches = len(texts) // batch_size + (1 if len(texts) % batch_size else 0)
-
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        print(f"Обработка пакета {i//batch_size + 1}/{total_batches} (размер: {len(batch)})...")        
-        # Токенизация
-        encoded_input = tokenizer(
-            batch,
-            padding=True,
-            truncation=True,
-            return_tensors='pt',
-            max_length=512
-        )        
-        # Инференс модели
-        with torch.no_grad():
-            model_output = model(**encoded_input)
-            # Используем mean pooling
-            batch_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
-        
-        # Конвертируем в список и добавляем к общему результату
-        embeddings.extend(batch_embeddings.cpu().tolist())
-    
+    for i, text in enumerate(texts):
+        if i % 10 == 0:  # Каждые 100 документов
+            print(f"Обработка {i}/{len(texts)}...")
+        try:
+            response = client.embeddings.create(model=model, input=text, timeout=30)
+            embeddings.append(response.data[0].embedding)
+        except APIConnectionError as e:
+            print(f"Ошибка подключения для текста {i}: {e}")
+            embeddings.append([0.0] * 1536)
+        except RateLimitError as e:
+            print(f"Превышен лимит для текста {i}: {e}")
+            embeddings.append([0.0] * 1536)
+        except Exception as e:
+            print(f"Неизвестная ошибка для текста {i}: {e}")
+            embeddings.append([0.0] * 1536)
     return embeddings
 
 
-def mean_pooling(model_output, attention_mask):
-    token_embeddings = model_output[0]  # Последние скрытые состояния
-    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-    sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
-    sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-    return sum_embeddings / sum_mask
+BATCH_SIZE = 100
+EMBEDDINGS_CACHE = "./embeddings_cache.pkl"
 
-# Собираем тексты для эмбеддингов
-texts = [doc.page_content for doc in documents]
-
-# Получаем эмбеддинги с пакетной обработкой
-print(f"Начинаем генерацию эмбеддингов для {len(texts)} текстов...")
-embeddings_array = get_embeddings_batch(
-    texts=texts, 
-    model=model,
-    tokenizer=tokenizer,
-    batch_size=32
-)
-print(f"Эмбеддинги сгенерированы!")
-
-# Загружаем существующее векторное хранилище (если оно есть)
-if os.path.exists("./chromadb"):
-    vectorstore = Chroma(
-        persist_directory="./chromadb",
-        embedding_function=None  # embedding не нужен — мы работаем с готовыми эмбеддингами
-    )
+# 1. Загрузка кеша или начало с нуля
+if os.path.exists(EMBEDDINGS_CACHE):
+    print("Загружаем кешированные эмбеддинги...")
+    with open(EMBEDDINGS_CACHE, "rb") as f:
+        embeddings_array = pickle.load(f)
+    # С какого индекса начинать следующую порцию
+    start_idx = len(embeddings_array)
+    print(f"Продолжаем с индекса {start_idx}")
 else:
-    # Если базы ещё нет — создаём новую
-    vectorstore = Chroma.from_embeddings(
-        embeddings=[],
-        documents=[],
-        embedding=None,
-        persist_directory="./chromadb"
-    )
+    embeddings_array = []
+    start_idx = 0
+    print(f"Начинаем генерацию эмбеддингов для {len(texts)} текстов...")
 
-# Удаляем старые версии документов с теми же ID
-doc_ids = [doc.metadata["id"] for doc in documents]
-existing_docs = vectorstore.get(ids=doc_ids)
-existing_ids = [doc.metadata["id"] for doc in existing_docs["documents"]]
+# 2. Обработка порциями
+for i in range(start_idx, len(texts), BATCH_SIZE):
+    # Берём порцию: от i до i + BATCH_SIZE (или до конца)
+    batch = texts[i:i + BATCH_SIZE]
+    print(f"Обработка порции {i}–{min(i + len(batch) - 1, len(texts) - 1)}...")
+    
+    batch_embeddings = []  # Здесь будут эмбеддинги текущей порции
+    text_counter = 0  # Счётчик текстов внутри батча
+    for text in batch:
+        text_counter += 1
+        if text_counter % 10 == 0:
+            print(f"  Обработано {text_counter} текстов в текущем батче")
+        try:
+            response = client.embeddings.create(
+                model="text-embedding-3-small",
+                input=text,
+                timeout=30
+            )
+            batch_embeddings.append(response.data[0].embedding)
+        except Exception as e:
+            print(f"Ошибка для текста: {e}")
+            # Заглушка при ошибке (вектор из нулей)
+            batch_embeddings.append([0.0] * 1536)
+    
+    # Добавляем обработанную порцию к общему массиву
+    embeddings_array.extend(batch_embeddings)
+    
+    # Сохраняем прогресс в кеш
+    with open(EMBEDDINGS_CACHE, "wb") as f:
+        pickle.dump(embeddings_array, f)
+    print(f"Сохранено {len(embeddings_array)} эмбеддингов")
 
 
-if existing_ids:
-    vectorstore.delete(ids=existing_ids)
-    print(f"Удалено {len(existing_ids)} устаревших документов")
+print(f"Готово: сгенерировано {len(embeddings_array)} эмбеддингов")
 
-# Добавляем обновлённые документы
-print(f"Добавляем {len(documents)} новых документов...")
-vectorstore.add_embeddings(
-    embeddings=embeddings_array,
-    documents=documents
+
+# Проверка 1: совпадение длин текстов и эмбеддингов
+if len(texts) != len(embeddings_array):
+    print(f"Ошибка: число текстов ({len(texts)}) не совпадает с числом эмбеддингов ({len(embeddings_array)}).")
+    exit(1)
+
+# Проверка 2: размер эмбеддинга (для text-embedding-3-small это 1536)
+if embeddings_array:
+    emb_size = len(embeddings_array[0])
+    if emb_size != 1536:
+        print(f"Ошибка: размер эмбеддинга {emb_size}, ожидается 1536.")
+        exit(1)
+
+# Проверка 3: нет ли пустых текстов или эмбеддингов
+empty_texts = [i for i, t in enumerate(texts) if not t.strip()]
+if empty_texts:
+    print(f"Предупреждение: найдены пустые тексты на позициях {empty_texts}. Удаляем...")
+    # Фильтруем пустые
+    texts = [t for t in texts if t.strip()]
+    embeddings_array = [emb for i, emb in enumerate(embeddings_array) if i not in empty_texts]
+
+
+if not texts or not embeddings_array:
+    print("Ошибка: после фильтрации не осталось валидных данных.")
+    exit(1)
+
+doc_db = {}
+for i, doc in enumerate(documents):
+    doc_db[doc.metadata["id"]] = {
+        "document": doc,
+        "embedding": np.array(embeddings_array[i])  # numpy
+    }
+
+with open("doc_db.pkl", "wb") as f:
+    pickle.dump(doc_db, f)
+
+"""
+pp = pprint.PrettyPrinter(indent=2)
+
+pp.pprint(doc_db)
+print(f"Всего документов в doc_db: {len(doc_db)}")
+# Проверяем, все ли эмбеддинги одинаковой длины
+emb_lengths = [len(data["embedding"]) for data in doc_db.values()]
+print(f"Длина эмбеддингов: {set(emb_lengths)} (должно быть {emb_lengths[0]})")
+# Список всех ID
+print(f"Список ID: {list(doc_db.keys())}")
+"""
+"""
+for doc_id, data in doc_db.items():
+    print(f"ID: {doc_id}")
+    print(f"  Metadata: {data['document'].metadata}")
+    print(f"  Content length: {len(data['document'].page_content)} символов")
+    print(f"  Embedding shape: {data['embedding'].shape}")
+    print("-! * 50")
+"""
+
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+
+# === 1. Загрузка базы документов (из предыдущего этапа) ===
+with open("doc_db.pkl", "rb") as f:
+    doc_db = pickle.load(f)
+
+print(f"✅ Загружено документов: {len(doc_db)}")
+
+# ================== 2. Вопрос пользователя СЮДА ПИСАТЬ ВОПРОС ===================
+questions_df = pd.read_csv(
+    './data/questions.csv',
+    sep=None,  # автоопределение разделителя
+    engine='python'  # требуется для auto-sep
+)
+print(f"📥 Загружено {len(questions_df)} вопросов из questions.csv")
+# Полная очистка всех скрытых символов в названиях столбцов
+questions_df.columns = (
+    questions_df.columns
+    .str.replace(r'[^\w\s]', '', regex=True)  # убираем невидимые и спецсимволы
+    .str.strip()  # убираем пробелы по краям
 )
 
+# Проверяем, какие колонки реально есть:
+print("📋 Найденные колонки:", list(questions_df.columns))
 
-# Сохраняем на диск
-print("Сохраняем векторное хранилище...")
-vectorstore.persist()
-print("Готово! Векторное хранилище обновлено.")
+
+# === 3. Настройка OpenAI-клиентов ===
+llm = ChatOpenAI(
+    api_key="sk-BuwLErZ4eL4yTAjfQxLaIA",  # ключ для LLM
+    base_url="https://ai-for-finance-hack.up.railway.app/",
+    model="openrouter/mistralai/mistral-small-3.2-24b-instruct",
+    temperature=0.2,
+    max_tokens=500
+)
+emb_client = OpenAI(
+    base_url="https://ai-for-finance-hack.up.railway.app/",
+    api_key="sk-k4GzLvBEsBYNbtVPpDaEMg"
+)
+
+# === 4. Результаты будем сохранять сюда ===
+results = []
+
+# === 5. Проходим по всем вопросам ===
+for idx, row in questions_df.iterrows():
+    question_id = row['ID вопроса']
+    user_question = row['Вопрос']
+    print(f"\n===============================")
+    print(f"🧩 Вопрос {question_id}: {user_question}")
+
+  # === 5.1 Генерация эмбеддинга вопроса ===
+    try:
+        question_emb = emb_client.embeddings.create(
+            model="text-embedding-3-small",
+            input=user_question
+        ).data[0].embedding
+    except Exception as e:
+        print(f"⚠️ Ошибка при генерации эмбеддинга: {e}")
+        results.append([question_id, user_question, "", f"Ошибка: {e}"])
+        continue
+
+
+    # === 4. Поиск ближайших документов ===
+    # Косинусное сходство
+    def cosine_similarity(a, b):
+        a = np.array(a)
+        b = np.array(b)
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+    # Считаем схожесть между вопросом и каждым документом
+    similarities = []
+    for doc_id, doc_data in doc_db.items():
+        sim = cosine_similarity(question_emb, doc_data["embedding"])
+        similarities.append((doc_id, sim))
+
+    # Сортируем документы по схожести и выбираем топ-5
+    top_docs = sorted(similarities, key=lambda x: x[1], reverse=True)[:4]
+
+    # === 5. Формируем контекст из ближайших документов ===
+    context_parts = []
+    for doc_id, sim in top_docs:
+        doc = doc_db[doc_id]["document"]
+        meta = doc.metadata
+        block = (
+            f"Текст: {doc.page_content}\n"
+            f"Аннотация: {meta.get('annotation', '')}\n"
+            f"Теги: {meta.get('tags', '')}"
+        )
+        context_parts.append(block)
+
+    context = "\n\n".join(context_parts)
+
+
+    # ====================== 6. Формируем промпт. СЮДА ВСТАВЛЯТЬ ПРОМТ ===========================
+    system_prompt = (
+        "Ты - премиум-консультант с 20-летним стажем в банке. Думай шаг за шагом и сравнивай контекст между собой. Контекст важен, ты должен сравнить его в несколько этапов. Естественно Отвечай на вопрос понятным языком. Все ответы должны быть на русском языке. Если в вопросе содержится много орфографических или пунктуационных ошибок, сначала попытайся максимально точно понять вопрос. Если из вопроса не понятна суть, ты должен попросить переформулировать вопрос в вежливой манере. Если клиент задает несколько вопросов, отвечай на них по очереди и разделяй ответы для удобного чтения. Формат ответа, его длина, стиль, пунктуация, орфография и структура должны совпадать с данными примерами вопрос-ответ. Ты не должен использовать разметку markdown и специальные символы. Если начинаешь ответ с нового пункта или структурируешь - пиши новые пункты с новой строки. Ты не должен решать за клиента что ему надо делать и не предлагай варианты выбора несколько раз. Ты должен учитывать роль банка в ответах и отвечать без повторов, без воды и с высокой плотностью содержания, не додумывай информацию. Если не можешь привести конкретный пример - не пиши его. Сначала проанализируй вопрос, затем сделай вывод на основе контекста, далее сформируй несколько вариантов ответа и проанализируй лучший из них. НИКОГДА не проси: пароли, CVV, SMS-коды, номера карт и любые личные данные в закрытом доступе. Если клиент называет - перенаправляй на реального оператора, если такой имеется, или предоставь данные банка для прямой связи с оператором. Аудитория, которая задает тебе вопросы может быть самая разная, всех полов и возрастов, между ними нет разницы и ты должен отвечать всем одинаково, не хамить, не использовать сленг, запрещено оскорблять пользователя, который задает вопрос. Ты должен отвечать без вступления и слэнга, четко на поставленный вопрос. Если вопрос не связан с банком и ответа на него нет в базе знаний - отвечай, что ты консультируешь по вопросам, относящимся к банку в вежливой манере и спроси есть ли вопрос, связанный с банком. Отвечай на вопросы без воды и четко. Пример вопросов: Вопрос: Как часто выплачивается купон по облигации? Возможный ответ: Процентная выплата по облигации, которую получает держатель облигации, обычно устанавливается в процентах годовых от номинала облигации. Купон может выплачиваться один или несколько раз в год. Купон обычно выплачивается на брокерский счет клиента. Вопрос: Как опционные стратегии утилизируют деривативный лимит? Возможный ответ: Лимит, который позволяет компании заключать сделки хеджирования без обеспечения. То же самое, что и FXD- лимит. Деривативный лимит необходим только в тех сделках хеджирования, по которым компания несет обязательства перед банком (форвард, collar, seagull, продажа опциона компанией). Деривативный лимит может быть установлен по упрощенному Digital-процессу или с проведением полного кредитного анализа отчетности компании. Установка деривативного лимита в рамках Digital-процесса занимает около 1 недели и требует предоставления упрощенного пакета документов из 1С. Установка деривативного лимита по стандартному процессу через лимитную заявку занимает около 1 месяца. Максимальный объем сделки хеджирования определяется размером деривативного лимита. Максимальный объем сделки равен размеру деривативного лимита, деленного на риск-вес. Риск-вес зависит от срока сделки и валютной пары. Чем длиннее срок - тем выше риск-вес. Деривативный лимит позволяет заключать сделки как в онлайн-банке, так и по телефону с трейдером. Компании необходимо обеспечить сумму продажи на счете списания до 18:00 даты расчетов по сделке, если не указано иное. Вопрос: Как изменение ключевой ставки влияет на цену облигации с фиксированной ставкой? Возможный ответ: Облигации, купон по которым установлен фиксированным значением. Например, купон может быть 5%, 10%. Обычно цена таких облигаций сильно зависит от ключевой ставки. Если ключевая ставка выше купона - цена облигации ниже. Если ключевая ставка ниже купона - цена облигации выше. Если ключевая ставка растет, цена облигации падает. Если ключевая ставка падает, цена облигации растет. Обычно, чем ближе срок погашения облигации, тем ближе цена облигации к номиналу. Вместе с вопросами есть Текст, который является основной информацией для ответа - это часть статьи. Аннотация это описание статьи. Теги обозначают связанную тему статьи. ")
+    user_prompt = f"Контекст:\n{context}\n\nВопрос:\n{user_question}\n\nОтвет:" # сюда автоматически подтягивается контект и вопрос 
+
+    # === 7. Отправляем запрос к LLM  ===
+    print("\n🤖 Отправка запроса к модели...")
+    try:
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ]
+        response = llm.invoke(messages)
+        answer_text = response.content.strip()
+    except Exception as e:
+        print(f"⚠️ Ошибка при получении ответа от модели: {e}")
+        answer_text = f"Ошибка при обработке: {e}"
+
+    # === 5.6 Сохраняем результат ===
+    results.append([question_id, user_question, context, answer_text])
+
+    print(f"✅ Ответ получен для вопроса {question_id}")
+
+# === 6. Сохраняем всё в CSV ===
+output_df = pd.DataFrame(results, columns=["ID вопроса", "Вопрос", "Контекст", "Ответ"])
+output_df.to_csv("./submission.csv", index=False, encoding="utf-8-sig")
+print("\n💾 Все ответы сохранены")
