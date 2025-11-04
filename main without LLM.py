@@ -18,6 +18,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 train_data = pd.read_csv('./data/train_data.csv')
 
 # 2. Очистка текста от лишних символов
+train_data['text'] = train_data['text'].astype(str).str[:-8]
 def clean_text(text):
     # Удаляем символы Markdown (#, ** и др.) и прочие нетекстовые элементы
     text = re.sub(r'[#*]+', '', text)  # Удаляем # и *
@@ -41,8 +42,8 @@ def count_tokens(text):
 
 # 4. Разбивка текста на эмбеддинги (чанки)
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,  # Целевая длина в токенах
-    chunk_overlap=50,  # Перекрытие в токенах
+    chunk_size=750,  # Целевая длина в токенах
+    chunk_overlap=70,  # Перекрытие в токенах
     length_function=count_tokens,  # Функция подсчёта длины
 )
 
@@ -104,7 +105,7 @@ def get_openai_embeddings(texts, model="text-embedding-3-small"):
     """Генерирует эмбеддинги через OpenAI API"""
     embeddings = []
     for i, text in enumerate(texts):
-        if i % 10 == 0:  # Каждые 100 документов
+        if i % 10 == 0:  # Каждые 10 документов
             print(f"Обработка {i}/{len(texts)}...")
         try:
             response = client.embeddings.create(model=model, input=text, timeout=30)
@@ -121,7 +122,7 @@ def get_openai_embeddings(texts, model="text-embedding-3-small"):
     return embeddings
 
 
-BATCH_SIZE = 100
+BATCH_SIZE = 50
 EMBEDDINGS_CACHE = "./embeddings_cache.pkl"
 
 # 1. Загрузка кеша или начало с нуля
@@ -312,7 +313,6 @@ for idx, row in questions_df.iterrows():
         meta = doc.metadata
         block = (
             f"Текст: {doc.page_content}\n"
-            f"Аннотация: {meta.get('annotation', '')}\n"
             f"Теги: {meta.get('tags', '')}"
         )
         context_parts.append(block)
