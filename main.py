@@ -15,7 +15,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # 1. Загрузка данных
-train_data = pd.read_csv('./data/train_data.csv')
+train_data = pd.read_csv('train_data.csv')
 
 # 2. Очистка текста от лишних символов
 train_data['text'] = train_data['text'].astype(str).str[:-8]
@@ -239,7 +239,7 @@ print(f"✅ Загружено документов: {len(doc_db)}")
 
 # ================== 2. Вопрос пользователя СЮДА ПИСАТЬ ВОПРОС ===================
 questions_df = pd.read_csv(
-    './data/questions.csv',
+    'questions.csv',
     sep=None,  # автоопределение разделителя
     engine='python'  # требуется для auto-sep
 )
@@ -353,16 +353,21 @@ df = pd.read_csv('./data/answers.csv', encoding='utf-8')
 
 # Удаляем столбец "Контекст"
 df = df.drop(columns=['Контекст'])
+
+df['Вопрос'] = df['Вопрос'].str.replace('["«»]', '', regex=True)  # удаляем все виды кавычек
+df['Вопрос'] = df['Вопрос'].str.strip()  # убираем пробелы по краям
+
 # Переименовываем столбец "Ответ модели"
 df = df.rename(columns={'Ответ модели': 'Ответы на вопрос'})
 
 # Удаляем лишние кавычки и форматирование
 df['Ответы на вопрос'] = df['Ответы на вопрос'].str.replace('"', '')
+df['Ответы на вопрос'] = df['Ответы на вопрос'].str.replace('*', '')
 df['Ответы на вопрос'] = df['Ответы на вопрос'].str.replace('\n', ' ')  # убираем переносы строк
 df['Ответы на вопрос'] = df['Ответы на вопрос'].str.replace('  ', ' ')  # убираем двойные пробелы
 
 # Сохраняем очищенный файл
-df.to_csv('./data/submission.csv', index=False, encoding='utf-8')
+df.to_csv('submission.csv', index=False, encoding='utf-8')
 
 
 # Проверяем размеры файла
