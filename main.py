@@ -347,3 +347,26 @@ for idx, row in questions_df.iterrows():
 output_df = pd.DataFrame(results, columns=["ID вопроса", "Вопрос", "Контекст", "Ответ модели"])
 output_df.to_csv("./data/answers.csv", index=False, encoding="utf-8-sig")
 print("\n💾 Все ответы сохранены в ./data/answers.csv")
+
+# Читаем файл
+df = pd.read_csv('./data/answers.csv', encoding='utf-8')
+
+# Удаляем столбец "Контекст"
+df = df.drop(columns=['Контекст'])
+# Переименовываем столбец "Ответ модели"
+df = df.rename(columns={'Ответ модели': 'Ответы на вопрос'})
+
+# Удаляем лишние кавычки и форматирование
+df['Ответы на вопрос'] = df['Ответы на вопрос'].str.replace('"', '')
+df['Ответы на вопрос'] = df['Ответы на вопрос'].str.replace('\n', ' ')  # убираем переносы строк
+df['Ответы на вопрос'] = df['Ответы на вопрос'].str.replace('  ', ' ')  # убираем двойные пробелы
+
+# Сохраняем очищенный файл
+df.to_csv('./data/submission.csv', index=False, encoding='utf-8')
+
+
+# Проверяем размеры файла
+print(f"\n📊 Информация о файле:")
+print(f"Количество строк: {df.shape[0]}")
+print(f"Количество столбцов: {df.shape[1]}")
+print(f"Столбцы: {df.columns.tolist()}")
