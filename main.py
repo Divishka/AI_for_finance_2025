@@ -42,8 +42,8 @@ def count_tokens(text):
 
 # 4. Разбивка текста на эмбеддинги (чанки)
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=750,  # Целевая длина в токенах
-    chunk_overlap=70,  # Перекрытие в токенах
+    chunk_size=625,  # Целевая длина в токенах
+    chunk_overlap=55,  # Перекрытие в токенах
     length_function=count_tokens,  # Функция подсчёта длины
 )
 
@@ -87,9 +87,6 @@ for _, row in train_data.iterrows():
 
 # 6. Формирование текстов для эмбеддинга
 texts = [doc.page_content for doc in documents]
-MAX_TEXTS = 10000
-texts = texts[:MAX_TEXTS]
-print(f"Обрабатываем {len(texts)} текстов (лимит: {MAX_TEXTS})")
 
 if not texts:
     print("Список texts пуст. Завершаем работу.")
@@ -173,32 +170,6 @@ for i in range(start_idx, len(texts), BATCH_SIZE):
 
 print(f"Готово: сгенерировано {len(embeddings_array)} эмбеддингов")
 
-
-# Проверка 1: совпадение длин текстов и эмбеддингов
-if len(texts) != len(embeddings_array):
-    print(f"Ошибка: число текстов ({len(texts)}) не совпадает с числом эмбеддингов ({len(embeddings_array)}).")
-    exit(1)
-
-# Проверка 2: размер эмбеддинга (для text-embedding-3-small это 1536)
-if embeddings_array:
-    emb_size = len(embeddings_array[0])
-    if emb_size != 1536:
-        print(f"Ошибка: размер эмбеддинга {emb_size}, ожидается 1536.")
-        exit(1)
-
-# Проверка 3: нет ли пустых текстов или эмбеддингов
-empty_texts = [i for i, t in enumerate(texts) if not t.strip()]
-if empty_texts:
-    print(f"Предупреждение: найдены пустые тексты на позициях {empty_texts}. Удаляем...")
-    # Фильтруем пустые
-    texts = [t for t in texts if t.strip()]
-    embeddings_array = [emb for i, emb in enumerate(embeddings_array) if i not in empty_texts]
-
-
-if not texts or not embeddings_array:
-    print("Ошибка: после фильтрации не осталось валидных данных.")
-    exit(1)
-
 doc_db = {}
 for i, doc in enumerate(documents):
     doc_db[doc.metadata["id"]] = {
@@ -209,25 +180,6 @@ for i, doc in enumerate(documents):
 with open("doc_db.pkl", "wb") as f:
     pickle.dump(doc_db, f)
 
-"""
-pp = pprint.PrettyPrinter(indent=2)
-
-pp.pprint(doc_db)
-print(f"Всего документов в doc_db: {len(doc_db)}")
-# Проверяем, все ли эмбеддинги одинаковой длины
-emb_lengths = [len(data["embedding"]) for data in doc_db.values()]
-print(f"Длина эмбеддингов: {set(emb_lengths)} (должно быть {emb_lengths[0]})")
-# Список всех ID
-print(f"Список ID: {list(doc_db.keys())}")
-"""
-"""
-for doc_id, data in doc_db.items():
-    print(f"ID: {doc_id}")
-    print(f"  Metadata: {data['document'].metadata}")
-    print(f"  Content length: {len(data['document'].page_content)} символов")
-    print(f"  Embedding shape: {data['embedding'].shape}")
-    print("-! * 50")
-"""
 
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
 
@@ -291,20 +243,21 @@ for idx, row in questions_df.iterrows():
 
 
     # === 4. Поиск ближайших документов ===
-    # Косинусное сходство
-    def cosine_similarity(a, b):
-        a = np.array(a)
-        b = np.array(b)
-        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-    # Считаем схожесть между вопросом и каждым документом
     similarities = []
     for doc_id, doc_data in doc_db.items():
-        sim = cosine_similarity(question_emb, doc_data["embedding"])
+        a = np.array(question_emb)
+        b = np.array(doc_data["embedding"])
+        sim = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
         similarities.append((doc_id, sim))
 
-    # Сортируем документы по схожести и выбираем топ-5
+    # сортируем и фильтруем по порогу 0.8
+    similarities = [s for s in similarities if s[1] >= 0.8]
     top_docs = sorted(similarities, key=lambda x: x[1], reverse=True)[:4]
+
+    # если вообще ничего не прошло порог — возьмём 2 лучших по схожести
+    if not top_docs:
+        top_docs = sorted(similarities, key=lambda x: x[1], reverse=True)[:2]
+
 
     # === 5. Формируем контекст из ближайших документов ===
     context_parts = []
@@ -313,6 +266,7 @@ for idx, row in questions_df.iterrows():
         meta = doc.metadata
         block = (
             f"Текст: {doc.page_content}\n"
+            f"Аннотация: {meta.get('annotation', '')}\n"
             f"Теги: {meta.get('tags', '')}"
         )
         context_parts.append(block)
@@ -342,6 +296,11 @@ for idx, row in questions_df.iterrows():
     results.append([question_id, user_question, context, answer_text])
 
     print(f"✅ Ответ получен для вопроса {question_id}")
+
+def print_prompt_info(prompt_text):
+    tokens = count_tokens(prompt_text)
+    print(f"📏 Длина промпта: {tokens} токенов")
+print_prompt_info(system_prompt + user_prompt)
 
 # === 6. Сохраняем всё в CSV ===
 output_df = pd.DataFrame(results, columns=["ID вопроса", "Вопрос", "Контекст", "Ответ модели"])
